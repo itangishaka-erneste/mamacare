@@ -5,8 +5,8 @@
 // Use it:  import Home from './Home';  <Home />
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 
-const API_URL = 'http://localhost:5000'; // your backend address (change it when you deploy)
-const GOOGLE_CLIENT_ID = ''; // paste the same Google Client ID that is in the server .env (xxxx.apps.googleusercontent.com)
+const API_URL = 'https://mamacare-730q.onrender.com'; // your backend address (change it when you deploy)
+const GOOGLE_CLIENT_ID = '598599284066-16gsfrm8bvcl8ck8d0n6p1tpnami97la.apps.googleusercontent.com'; // paste the same Google Client ID that is in the server .env (xxxx.apps.googleusercontent.com)
 
 /* ================= global stores: loading, language, theme ================= */
 const subscribe = (set) => (cb) => { set.add(cb); return () => set.delete(cb); };
