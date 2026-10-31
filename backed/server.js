@@ -1,29 +1,14 @@
-// Mama Care Rwanda: Express API (v2)
+// Mama Care Rwanda: Express API (v3, OpenAI / ChatGPT)
 // Needs Node 18+.  npm i express cors helmet express-rate-limit pg bcryptjs jsonwebtoken google-auth-library dotenv
 //
-// .env
-//   PORT=5000
-//   DB_HOST=localhost  DB_PORT=5432  DB_NAME=...  DB_USER=postgres  DB_PASSWORD=...   (see db.js)
-//   PGSSL=false                         (true for most hosted Postgres)
-//   JWT_SECRET=long-random-string
-//   CLIENT_URL=http://localhost:5173    (comma-separate several origins)
-//   GOOGLE_CLIENT_ID=xxxx.apps.googleusercontent.com
-//   ADMIN_EMAILS=you@gmail.com,nurse@gmail.com
-//   ADMIN_NAME=Dr. Uwimana A.
-//   ADMIN_PHONE=0788123456
-//   ADMIN_PIN=your-admin-pin
-//   AI_API_KEY=                         (Anthropic key; leave empty for built-in fallback replies)
-//   AI_MODEL=claude-sonnet-5-5
-//   AT_USERNAME=sandbox                 (Africa's Talking)
-//   AT_API_KEY=
-//   AT_URL=https://api.sandbox.africastalking.com/version1/messaging
-//   SMS_WEBHOOK_KEY=another-random-string
+// See env-example.txt for the .env file. The AI uses your OpenAI key:
+//   OPENAI_API_KEY=sk-...     AI_MODEL=gpt-4o-mini
 //
 // Callback URLs to set at your provider (Africa's Talking):
 //   SMS:   https://YOUR-API/api/sms/inbound?key=SMS_WEBHOOK_KEY
 //   USSD:  https://YOUR-API/api/ussd?key=SMS_WEBHOOK_KEY
 //
-// New tables (cases, referrals, followups, facilities, ussd_logs) are created automatically at start.
+// Every table is created automatically at start (safe to run again and again).
 
 require('dotenv').config();
 const express = require('express');
@@ -35,17 +20,19 @@ const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
 const { q } = require('./db');
 
-for (const k of ['DB_NAME', 'DB_USER', 'DB_PASSWORD', 'JWT_SECRET']) {
-  if (!process.env[k]) { console.error(`Missing ${k} in .env`); process.exit(1); }
-}
+if (!process.env.JWT_SECRET) { console.error('Missing JWT_SECRET in .env'); process.exit(1); }
+if (!process.env.DATABASE_URL && !process.env.DB_NAME) { console.error('Set DATABASE_URL or DB_NAME (with DB_USER and DB_PASSWORD) in .env'); process.exit(1); }
 
 const app = express();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
 const h = (fn) => (req, res, next) => fn(req, res, next).catch(next);
+const AI_KEY = () => process.env.OPENAI_API_KEY || process.env.AI_API_KEY || '';
+const AI_MODEL = () => process.env.AI_MODEL || 'gpt-4o-mini';
 
+app.set('trust proxy', 1);
 app.use(helmet());
-const ORIGINS = (process.env.CLIENT_URL || '').split(',').map((o) => o.trim()).filter(Boolean);
+const ORIGINS = (process.env.CLIENT_URL || '').split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean);
 const DEV_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/;
 app.use(cors({
   origin: (origin, cb) =>
@@ -57,8 +44,29 @@ app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 60 }));
 
 /* ---------------- schema (safe to run at every start) ---------------- */
 async function ensureSchema() {
-  const sql = [
+  const must = [
     `CREATE SEQUENCE IF NOT EXISTS case_code_seq START 1001`,
+    `CREATE TABLE IF NOT EXISTS users(
+       id SERIAL PRIMARY KEY, name TEXT NOT NULL, phone TEXT, email TEXT, pin_hash TEXT, google_id TEXT,
+       role TEXT NOT NULL DEFAULT 'user', source TEXT DEFAULT 'web', language TEXT DEFAULT 'en',
+       created_at TIMESTAMPTZ DEFAULT now(), last_login TIMESTAMPTZ)`,
+    `CREATE TABLE IF NOT EXISTS notifications(
+       id SERIAL PRIMARY KEY, user_id INT, type TEXT DEFAULT 'info', title TEXT, body TEXT,
+       read BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT now())`,
+    `CREATE TABLE IF NOT EXISTS activity_log(
+       id SERIAL PRIMARY KEY, actor_id INT, action TEXT, target TEXT, detail TEXT, created_at TIMESTAMPTZ DEFAULT now())`,
+    `CREATE TABLE IF NOT EXISTS questions(
+       id SERIAL PRIMARY KEY, user_id INT, phone TEXT, source TEXT DEFAULT 'web', body TEXT, ai_answer TEXT,
+       flagged BOOLEAN NOT NULL DEFAULT FALSE, status TEXT NOT NULL DEFAULT 'open', created_at TIMESTAMPTZ DEFAULT now())`,
+    `CREATE TABLE IF NOT EXISTS sms_messages(
+       id SERIAL PRIMARY KEY, phone TEXT, direction TEXT, body TEXT, user_id INT, created_at TIMESTAMPTZ DEFAULT now())`,
+    `CREATE TABLE IF NOT EXISTS doctor_requests(
+       id SERIAL PRIMARY KEY, user_id INT NOT NULL, reason TEXT, preferred_date DATE, preferred_time TEXT,
+       method TEXT DEFAULT 'Video call', notes TEXT, status TEXT NOT NULL DEFAULT 'pending', admin_note TEXT,
+       reviewed_by INT, reviewed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`,
+    `CREATE TABLE IF NOT EXISTS call_requests(
+       id SERIAL PRIMARY KEY, user_id INT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', transcript TEXT,
+       created_at TIMESTAMPTZ DEFAULT now())`,
     `CREATE TABLE IF NOT EXISTS facilities(
        id SERIAL PRIMARY KEY, name TEXT NOT NULL, district TEXT, type TEXT DEFAULT 'Health facility',
        phone TEXT, created_at TIMESTAMPTZ DEFAULT now())`,
@@ -81,9 +89,20 @@ async function ensureSchema() {
     `CREATE TABLE IF NOT EXISTS ussd_logs(
        id SERIAL PRIMARY KEY, session_id TEXT, phone TEXT, input TEXT, response TEXT,
        created_at TIMESTAMPTZ DEFAULT now())`,
-    `ALTER TABLE call_requests ADD COLUMN IF NOT EXISTS transcript TEXT`,
   ];
-  for (const s of sql) await q(s);
+  for (const s of must) await q(s);
+
+  // Older databases may be missing a few columns or indexes. These are best effort.
+  const soft = [
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'en'`,
+    `ALTER TABLE call_requests ADD COLUMN IF NOT EXISTS transcript TEXT`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uq ON users(phone)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS users_email_uq ON users(email)`,
+  ];
+  for (const s of soft) { try { await q(s); } catch (e) { console.warn('Schema note:', e.message); } }
+
   if (!(await q('SELECT 1 FROM facilities LIMIT 1')).rowCount) {
     for (const [name, district, type] of [
       ['Butaro District Hospital', 'Burera', 'District hospital'],
@@ -145,44 +164,55 @@ async function sendSms(phone, message, userId = null) {
   } catch (e) { console.error('SMS error:', e.message); }
 }
 
-/* ---------------- AI assistant + flagging ---------------- */
+/* ---------------- AI assistant (OpenAI) + flagging ---------------- */
 const SERIOUS = /(lump|bleed|blood|discharge|swelling|dimpl|severe|emergency|urgent|faint|breath|suicid|kill myself|unbearable)/i;
 
 const FALLBACK =
   "Thank you for sharing. It's good that you asked early. Please visit your nearest health center for a check-up, " +
   'or book a virtual doctor or call Mama Care for support. I cannot diagnose, but a health professional can help you.';
-const FALLBACK_STAFF = 'The AI service is not configured (AI_API_KEY is empty). Please follow your clinical protocol and escalate to a doctor if unsure.';
+const FALLBACK_STAFF = 'The AI service is not connected yet (add OPENAI_API_KEY to .env). Please follow your clinical protocol and escalate to a doctor if unsure.';
 
 const SYS_PATIENT =
   'You are the Mama Care Rwanda assistant for breast health support. Be warm, calm and brief (under 120 words), ' +
-  'use simple language, never diagnose, give 2-3 safe next steps, and suggest a clinic visit, a virtual doctor ' +
-  'meeting or calling Mama Care. For emergencies tell the person to go to the nearest health facility now.';
+  'use simple language, never diagnose, give 2 or 3 safe next steps, and suggest a clinic visit, a virtual doctor ' +
+  'meeting or calling Mama Care. Reply in the same language the person writes in (English or Kinyarwanda). ' +
+  'For emergencies tell the person to go to the nearest health facility now.';
 const SYS_STAFF =
   'You support Mama Care Rwanda case workers and community health workers. Be concise and practical (under 150 words). ' +
   'Help with triage questions, referral steps, what to ask a patient, and how to explain next steps simply. ' +
   'Never give a diagnosis. Recommend escalation to a doctor for any red-flag symptom.';
 
-async function askAI(text, system = SYS_PATIENT, fallback = FALLBACK, max = 400) {
-  if (!process.env.AI_API_KEY) return fallback;
+const cleanHistory = (history) =>
+  (Array.isArray(history) ? history : []).slice(-8)
+    .map((m) => ({ role: m.role === 'me' || m.role === 'user' ? 'user' : 'assistant', content: String(m.text || m.content || '').slice(0, 800) }))
+    .filter((m) => m.content.trim());
+
+async function askAI(text, system = SYS_PATIENT, fallback = FALLBACK, max = 400, history = []) {
+  const key = AI_KEY();
+  if (!key) return fallback;
+  const model = AI_MODEL();
+  const reasoning = /^(gpt-5|o\d)/i.test(model); // reasoning models need a bigger token budget
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
-      headers: { 'x-api-key': process.env.AI_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: process.env.AI_MODEL || 'claude-sonnet-5-5',
-        max_tokens: max,
-        system,
-        messages: [{ role: 'user', content: text }],
+        model,
+        messages: [{ role: 'system', content: system }, ...cleanHistory(history), { role: 'user', content: text }],
+        max_completion_tokens: reasoning ? max * 6 : max,
+        ...(reasoning ? {} : { temperature: 0.4 }),
       }),
+      signal: AbortSignal.timeout(25000),
     });
-    const data = await r.json();
-    return data.content?.[0]?.text || fallback;
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { console.error('OpenAI error', r.status, data.error?.message || ''); return fallback; }
+    return data.choices?.[0]?.message?.content?.trim() || fallback;
   } catch (e) { console.error('AI error:', e.message); return fallback; }
 }
 
-async function saveQuestion({ user, phone, source, body }) {
+async function saveQuestion({ user, phone, source, body, history }) {
   const flagged = SERIOUS.test(body);
-  const ai = await askAI(body);
+  const ai = await askAI(body, SYS_PATIENT, FALLBACK, 400, history);
   const { rows } = await q(
     'INSERT INTO questions(user_id,phone,source,body,ai_answer,flagged) VALUES($1,$2,$3,$4,$5,$6) RETURNING *',
     [user?.id || null, phone || user?.phone || null, source, body, ai, flagged]);
@@ -209,7 +239,7 @@ const adminOnly = (req, res, next) =>
   req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Admins only.' });
 
 /* ---------------- auth routes ---------------- */
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, ai: !!AI_KEY(), model: AI_MODEL() }));
 
 app.post('/api/auth/register', h(async (req, res) => {
   const name = String(req.body.name || '').trim();
@@ -239,27 +269,33 @@ app.post('/api/auth/login', h(async (req, res) => {
   res.json({ token: sign(u), user: u });
 }));
 
+// Google sign-in works for patients and for admins. An email listed in ADMIN_EMAILS becomes an admin.
 app.post('/api/auth/google', h(async (req, res) => {
-  if (!process.env.GOOGLE_CLIENT_ID) return res.status(500).json({ error: 'Google sign-in is not configured.' });
+  if (!process.env.GOOGLE_CLIENT_ID) return res.status(500).json({ error: 'Google sign-in is not configured. Add GOOGLE_CLIENT_ID to the server .env file.' });
   let p;
   try {
     const ticket = await googleClient.verifyIdToken({ idToken: req.body.credential, audience: process.env.GOOGLE_CLIENT_ID });
     p = ticket.getPayload();
-  } catch { return res.status(401).json({ error: 'Google sign-in failed. Please try again.' }); }
+  } catch (e) {
+    console.error('Google verify failed:', e.message);
+    return res.status(401).json({ error: 'Google sign-in failed. Check that the Client ID matches on the server and the website.' });
+  }
   if (!p.email_verified) return res.status(401).json({ error: 'Your Google email is not verified.' });
 
-  const isAdmin = ADMIN_EMAILS.includes(p.email.toLowerCase());
-  let { rows } = await q('SELECT * FROM users WHERE google_id=$1 OR email=$2 LIMIT 1', [p.sub, p.email]);
+  const email = p.email.toLowerCase();
+  const isAdmin = ADMIN_EMAILS.includes(email);
+  let { rows } = await q('SELECT * FROM users WHERE google_id=$1 OR lower(email)=$2 LIMIT 1', [p.sub, email]);
   let u = rows[0];
   if (!u) {
     ({ rows } = await q(
       `INSERT INTO users(name,email,google_id,role,source) VALUES($1,$2,$3,$4,'google') RETURNING *`,
-      [p.name || p.email.split('@')[0], p.email, p.sub, isAdmin ? 'admin' : 'user']));
+      [p.name || email.split('@')[0], email, p.sub, isAdmin ? 'admin' : 'user']));
     u = rows[0];
     await notify(u.id, 'welcome', 'Welcome to Mama Care', 'Your support space is ready. Ask the assistant or request help any time.');
     await log(u.id, 'registered', 'user:' + u.id, 'google');
-  } else if (!u.google_id) {
-    await q('UPDATE users SET google_id=$1 WHERE id=$2', [p.sub, u.id]);
+  } else {
+    if (!u.google_id) await q('UPDATE users SET google_id=$1 WHERE id=$2', [p.sub, u.id]);
+    if (!u.email) await q('UPDATE users SET email=$1 WHERE id=$2', [email, u.id]);
   }
   if (isAdmin && u.role !== 'admin') {
     await q(`UPDATE users SET role='admin' WHERE id=$1`, [u.id]);
@@ -308,7 +344,7 @@ app.post('/api/questions', auth, h(async (req, res) => {
   const body = String(req.body.text || '').trim().slice(0, 1000);
   if (!body) return res.status(400).json({ error: 'Write a message first.' });
   const { rows } = await q(`SELECT ${COLS} FROM users WHERE id=$1`, [req.user.id]);
-  res.json(await saveQuestion({ user: rows[0], source: 'web', body }));
+  res.json(await saveQuestion({ user: rows[0], source: 'web', body, history: req.body.history }));
 }));
 
 /* ---------------- facilities (read for everyone signed in) ---------------- */
@@ -694,7 +730,7 @@ admin.delete('/facilities/:id', h(async (req, res) => {
 admin.post('/assistant', h(async (req, res) => {
   const text = String(req.body.text || '').trim().slice(0, 1500);
   if (!text) return res.status(400).json({ error: 'Write a message first.' });
-  res.json({ answer: await askAI(text, SYS_STAFF, FALLBACK_STAFF, 600) });
+  res.json({ answer: await askAI(text, SYS_STAFF, FALLBACK_STAFF, 600, req.body.history) });
 }));
 
 /* --- questions, sms, calls, ussd --- */
@@ -780,7 +816,7 @@ admin.get('/reports/cases.csv', h(async (_req, res) => {
 
 admin.get('/system', h(async (_req, res) => {
   res.json({
-    ai: !!process.env.AI_API_KEY, model: process.env.AI_MODEL || 'claude-sonnet-5-5',
+    ai: !!AI_KEY(), model: AI_MODEL(),
     sms: !!process.env.AT_API_KEY, google: !!process.env.GOOGLE_CLIENT_ID, ussd: !!process.env.SMS_WEBHOOK_KEY,
   });
 }));
@@ -806,7 +842,7 @@ async function seedAdmin() {
 }
 
 (async () => {
-  try { await ensureSchema(); await seedAdmin(); }
+  try { await ensureSchema(); await seedAdmin(); console.log(AI_KEY() ? `AI ready (${AI_MODEL()})` : 'AI off: add OPENAI_API_KEY to .env'); }
   catch (e) { console.error('Setup error:', e.message); }
 })();
 
