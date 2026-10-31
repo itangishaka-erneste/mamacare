@@ -7,7 +7,7 @@
 // Use it:  import Home from './Home';  <Home />
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 
-const API = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+const API = import.meta.env.API_URL || 'http://localhost:5000';
 const GOOGLE_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 
 /* ================= global stores: loading, language, theme ================= */
