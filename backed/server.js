@@ -31,12 +31,21 @@ const AI_KEY = () => process.env.OPENAI_API_KEY || process.env.AI_API_KEY || '';
 const AI_MODEL = () => process.env.AI_MODEL || 'gpt-4o-mini';
 
 app.set('trust proxy', 1);
-app.use(helmet());
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+
+// CORS: CLIENT_URL can hold several addresses separated by commas.
+// If CLIENT_URL is empty, every origin is allowed so you are never locked out by a missing setting.
 const ORIGINS = (process.env.CLIENT_URL || '').split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean);
 const DEV_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/;
+if (!ORIGINS.length) console.warn('CLIENT_URL is empty: allowing all origins. Set CLIENT_URL on Render to lock this down.');
 app.use(cors({
-  origin: (origin, cb) =>
-    cb(null, !origin || ORIGINS.includes(origin) || (process.env.NODE_ENV !== 'production' && DEV_ORIGIN.test(origin))),
+  origin: (origin, cb) => {
+    if (!origin || !ORIGINS.length || ORIGINS.includes(origin.replace(/\/$/, '')) || DEV_ORIGIN.test(origin)) return cb(null, true);
+    console.warn('CORS blocked origin:', origin);
+    return cb(null, false);
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: false }));
@@ -239,6 +248,7 @@ const adminOnly = (req, res, next) =>
   req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Admins only.' });
 
 /* ---------------- auth routes ---------------- */
+app.get('/', (_req, res) => res.json({ ok: true, name: 'Mama Care Rwanda API' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true, ai: !!AI_KEY(), model: AI_MODEL() }));
 
 app.post('/api/auth/register', h(async (req, res) => {
@@ -847,4 +857,4 @@ async function seedAdmin() {
 })();
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Mama Care API running on http://localhost:${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Mama Care API running on port ${PORT}`));
